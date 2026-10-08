@@ -1,6 +1,6 @@
 {
   "name": "ananoesis-shell-desktop",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "AnanoesisShell 桌面壳：监管本机 Spring Boot 后端并承载同源页面（见 openspec 变更 add-desktop-client）",
   "author": {

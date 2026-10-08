@@ -9,14 +9,49 @@
            - 滚动交给 xterm 原生 scrollback，单一滚动条，不再有嵌套滚动容器；
            - 命令留痕是纯文本行（含 ⏳待审批 / →已执行 / →已拒绝 状态），随历史自然沉淀。
     -->
-    <div ref="terminalContainer" class="terminal-container" data-region="active-terminal" :data-session-id="activeSessionId"></div>
+    <div
+      ref="terminalContainer"
+      class="terminal-container"
+      data-region="active-terminal"
+      :data-session-id="activeSessionId"
+      @contextmenu="handleContextMenu"
+    ></div>
+
+    <!--
+      自定义右键菜单（复制/粘贴）
+      WHY: 终端内浏览器默认右键菜单无法操作剪贴板（安全限制），
+           自定义菜单通过 navigator.clipboard API 实现复制粘贴功能
+    -->
+    <div
+      v-if="contextMenu.visible"
+      data-role="context-menu"
+      class="context-menu"
+      :style="{ left: contextMenu.x + 'px', top: contextMenu.y + 'px' }"
+    >
+      <button
+        data-action="copy"
+        class="context-menu-item"
+        :disabled="!hasSelection()"
+        @click="handleCopy"
+      >
+        复制
+      </button>
+      <button
+        data-action="paste"
+        class="context-menu-item"
+        @click="handlePaste"
+      >
+        粘贴
+      </button>
+    </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
+import { ref, reactive, onMounted, onBeforeUnmount, watch, nextTick } from 'vue'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
+import { ClipboardAddon } from '@xterm/addon-clipboard'
 import '@xterm/xterm/css/xterm.css'
 
 /**
@@ -45,7 +80,7 @@ const props = defineProps<{
   disconnected?: boolean
   /**
    * Agent 回合在飞（后端正在思考/工具循环中）：此时 Ctrl+C 从
-   * “取消输入草稿”升级为“打断回合”——写 ^C 留痕并 emit agentStop，
+   * "取消输入草稿"升级为"打断回合"——写 ^C 留痕并 emit agentStop，
    * 由父级经 AI 通道发 stop_turn；对标 Shell 模式 Ctrl+C 打断程序的体验。
    */
   generating?: boolean
@@ -73,16 +108,97 @@ let containerObserver: ResizeObserver | null = null
 let lastSyncedCols = 0
 let lastSyncedRows = 0
 
-/** 是否写了占位提示（“连接中...”或 ❯ 输入符），用于第一条真实输出到达时清除 */
+/** 是否写了占位提示（"连接中..."或 ❯ 输入符），用于第一条真实输出到达时清除 */
 let initialPromptWritten = false
+
+// ==================== 右键菜单状态 ====================
+/**
+ * 自定义右键菜单状态
+ * WHY: 浏览器默认右键菜单无法操作终端剪贴板，需要自定义菜单通过
+ *      navigator.clipboard API 实现复制粘贴功能
+ */
+const contextMenu = reactive({
+  visible: false,
+  x: 0,
+  y: 0,
+})
+
+/**
+ * 终端当前是否有选中文本（用于复制按钮状态）
+ * WHY: 使用函数而非 computed，因为 terminal.getSelection() 不是响应式的，
+ *      每次菜单打开或重新渲染时需要重新查询选中状态
+ */
+function hasSelection(): boolean {
+  if (!terminal) return false
+  return terminal.getSelection().length > 0
+}
 
 onMounted(() => {
   initTerminal()
+  // WHY: 点击菜单外区域时关闭菜单
+  document.addEventListener('click', handleDocumentClick)
 })
 
 onBeforeUnmount(() => {
   cleanupTerminal()
+  document.removeEventListener('click', handleDocumentClick)
 })
+
+/** 点击文档任意位置时关闭右键菜单 */
+function handleDocumentClick(): void {
+  contextMenu.visible = false
+}
+
+/** 处理右键菜单事件 */
+function handleContextMenu(event: MouseEvent): void {
+  // 禁用浏览器默认右键菜单
+  event.preventDefault()
+
+  // 计算菜单位置（边界检测：防止菜单溢出视口）
+  const menuWidth = 120
+  const menuHeight = 60
+  const x = event.clientX + menuWidth > window.innerWidth
+    ? event.clientX - menuWidth
+    : event.clientX
+  const y = event.clientY + menuHeight > window.innerHeight
+    ? event.clientY - menuHeight
+    : event.clientY
+
+  contextMenu.x = x
+  contextMenu.y = y
+  contextMenu.visible = true
+}
+
+/** 处理复制操作 */
+async function handleCopy(): Promise<void> {
+  if (!terminal) return
+  try {
+    const selection = terminal.getSelection()
+    if (selection) {
+      await navigator.clipboard.writeText(selection)
+    }
+  } catch (e) {
+    // WHY: Electron 失焦/权限策略变化会使 writeText reject，不捕获会成为
+    //      未处理 rejection 且用户无任何反馈；沿用 handlePaste 的日志降级
+    //      （组件无 toast 等用户反馈机制），与 Ctrl+C 路径的 .catch 静默降级
+    //      同一原则——复制失败不阻断终端交互，菜单照常关闭
+    console.error('[TerminalTimeline] 复制失败:', e)
+  }
+  contextMenu.visible = false
+}
+
+/** 处理粘贴操作 */
+async function handlePaste(): Promise<void> {
+  if (!terminal) return
+  try {
+    const text = await navigator.clipboard.readText()
+    // WHY: 通过 paste 方法将剪贴板内容作为终端输入发送
+    terminal.paste(text)
+  } catch (e) {
+    console.error('[TerminalTimeline] 粘贴失败:', e)
+  }
+  contextMenu.visible = false
+}
 
 /** 监听 activeSessionId 变化——tab 切换（旧值非空）时清空终端（不同连接实例历史独立） */
 watch(
@@ -106,7 +222,7 @@ const AGENT_PROMPT = '\x1b[36m❯\x1b[0m '
 /**
  * 监听模式切换——非破坏式，不写提示符。
  * WHY: Shell 与 Agent 共用同一个 xterm，切换仅改变输入路由，
- *      绝不 clear/reset 终端、不写“连接中...”。
+ *      绝不 clear/reset 终端、不写"连接中..."。
  *      ❯ 提示符采用惰性补打（见 handleAgentKey）：切模式时若立即写，
  *      远端 PTY 的异步输出（如 resize 引发的 bash 提示符重绘）会把光标
  *      拽回提示符行，用户输入看起来像打进了 shell——惰性补打保证
@@ -126,6 +242,7 @@ function initTerminal(): void {
     cursorBlink: true,
     convertEol: false,
     scrollback: 10000,
+    rightClickSelectsWord: true,
     theme: { background: '#0d1117', foreground: '#c9d1d9', cursor: '#58a6ff' },
     fontFamily: "'SF Mono', 'Cascadia Code', Consolas, 'Courier New', monospace",
     fontSize: 13,
@@ -134,6 +251,27 @@ function initTerminal(): void {
   fitAddon = new FitAddon()
   terminal.loadAddon(fitAddon)
 
+  // WHY: ClipboardAddon 0.2.0 仅注册 OSC 52 处理器（远端程序如 tmux/vim 经
+  //      OSC 52 序列写本地剪贴板），不含任何键绑定；组件内的复制/粘贴由
+  //      下方 Ctrl+C 分流与右键菜单经 navigator.clipboard 实现，与此 addon 无关
+  terminal.loadAddon(new ClipboardAddon())
+
+  // WHY: Ctrl+C 智能分流——xterm core 对「有选中的 Ctrl+C」没有复制语义，
+  //      放行只会发送 \x03 中断，因此复制语义必须自行分流实现：
+  //      有选中 → 经 navigator.clipboard 复制并拦截（不发 \x03）；
+  //      无选中 → 放行到 onData，保持 Shell \x03 中断 / Agent stop_turn 打断语义
+  terminal.attachCustomKeyEventHandler((event: KeyboardEvent) => {
+    if (event.ctrlKey && event.key === 'c') {
+      const selection = terminal?.getSelection() ?? ''
+      if (selection) {
+        navigator.clipboard.writeText(selection).catch(() => { /* 剪贴板写入失败静默降级 */ })
+        return false // 阻止默认中断行为（不发送 \x03）
+      }
+      // 无选中：放行到 onData 处理中断
+    }
+    return true
+  })
+
   if (terminalContainer.value) {
     terminal.open(terminalContainer.value)
   }
@@ -141,7 +279,7 @@ function initTerminal(): void {
 
   // WHY: 统一在 onData 中根据模式分发——Shell 转发 PTY，Agent 本地处理；
   //      断线终态下输入无投递目标，仅保留 r/R 作为重连快捷键（MobaXterm 惯例），
-  //      其余字节丢弃——继续转发只会收到后端“会话不存在”错误风暴
+  //      其余字节丢弃——继续转发只会收到后端"会话不存在"错误风暴
   dataDisposable = terminal.onData((data: string) => {
     if (props.disconnected) {
       if (data === 'r' || data === 'R') {
@@ -362,6 +500,7 @@ defineExpose({
   height: 100%;
   background: #0d1117;
   overflow: hidden;
+  position: relative;
 }
 
 .terminal-container {
@@ -395,5 +534,41 @@ defineExpose({
 
 .terminal-container :deep(.xterm-viewport)::-webkit-scrollbar-thumb:hover {
   background: #484f58;
+}
+
+/* ==================== 右键菜单样式 ==================== */
+/* WHY: 深色主题与现有工作区色板一致（GitHub Dark 风格） */
+.context-menu {
+  position: fixed;
+  z-index: 1000;
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 4px 0;
+  min-width: 100px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+.context-menu-item {
+  display: block;
+  width: 100%;
+  padding: 6px 16px;
+  font-size: 13px;
+  color: #c9d1d9;
+  background: transparent;
+  border: none;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.context-menu-item:hover:not(:disabled) {
+  background: #21262d;
+  color: #58a6ff;
+}
+
+.context-menu-item:disabled {
+  color: #484f58;
+  cursor: not-allowed;
 }
 </style>

@@ -1,7 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { mount } from '@vue/test-utils'
+import { mount, flushPromises } from '@vue/test-utils'
 import { nextTick } from 'vue'
 import TerminalTimeline from '@/components/terminal/TerminalTimeline.vue'
+// WHY: 从被 mock 的模块导入构造器，供 expect.any(ClipboardAddon) 精确匹配加载参数类型
+import { ClipboardAddon } from '@xterm/addon-clipboard'
 
 /**
  * TerminalTimeline 组件测试（单一 xterm 架构）
@@ -14,7 +16,11 @@ import TerminalTimeline from '@/components/terminal/TerminalTimeline.vue'
 
 // 捕获传给 terminal.onData 的回调，便于模拟用户按键
 let capturedOnData: ((data: string) => void) | null = null
+// 捕获 attachCustomKeyEventHandler 注册的键盘事件处理器
+let capturedKeyHandler: ((event: KeyboardEvent) => boolean) | null = null
 const mockWrite = vi.fn()
+const mockPaste = vi.fn()
+const mockGetSelection = vi.fn(() => '')
 // 捕获最近创建的 Terminal 实例与 FitAddon.fit，供尺寸同步用例改值/断言
 let capturedTerminal: { cols: number; rows: number } | null = null
 const mockFit = vi.fn()
@@ -40,6 +46,13 @@ vi.mock('@xterm/xterm', () => {
           capturedOnData = cb
           return { dispose: vi.fn() }
         }),
+        // WHY: 模拟 Ctrl+C 自定义键绑定——需要捕获组件注册的处理器以在测试中触发
+        attachCustomKeyEventHandler: vi.fn((handler: (event: KeyboardEvent) => boolean) => {
+          capturedKeyHandler = handler
+          return { dispose: vi.fn() }
+        }),
+        getSelection: mockGetSelection,
+        paste: mockPaste,
         element: document.createElement('div'),
         cols: 100,
         rows: 30,
@@ -59,6 +72,17 @@ vi.mock('@xterm/addon-fit', () => ({
   })),
 }))
 
+// WHY: ClipboardAddon 只是加载到 terminal 上，其内部逻辑由 xterm 管理；
+//      测试只需验证它被加载，不需要模拟其行为。
+//      实现走默认 this 实例化（不返回普通对象）：保证 new ClipboardAddon()
+//      产物 instanceof ClipboardAddon 成立，加载用例的 expect.any 精确匹配才有效
+vi.mock('@xterm/addon-clipboard', () => ({
+  ClipboardAddon: vi.fn().mockImplementation(function (this: any) {
+    this.activate = vi.fn()
+    this.dispose = vi.fn()
+  }),
+}))
+
 /** 以指定模式挂载组件（disconnected=断线终态，键盘输入被拦截用于重连触发） */
 function mountTimeline(mode: 'shell' | 'agent' = 'shell', disconnected = false) {
   return mount(TerminalTimeline, {
@@ -71,12 +95,19 @@ function typeData(data: string): void {
   capturedOnData?.(data)
 }
 
+/** 构造 Ctrl+C 键盘事件 */
+function createCtrlCEvent(): KeyboardEvent {
+  return new KeyboardEvent('keydown', { key: 'c', ctrlKey: true, bubbles: true })
+}
+
 describe('TerminalTimeline.vue（单一 xterm）', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     capturedOnData = null
+    capturedKeyHandler = null
     capturedTerminal = null
     observerCallbacks = []
+    mockGetSelection.mockReturnValue('')
     // jsdom 无 ResizeObserver：stub 收集回调，用例手动触发模拟容器尺寸变化
     vi.stubGlobal('ResizeObserver', class {
       constructor(cb: () => void) {
@@ -84,6 +115,16 @@ describe('TerminalTimeline.vue（单一 xterm）', () => {
       }
       observe() {}
       disconnect() {}
+    })
+    // WHY: mock navigator.clipboard——jsdom 不实现 Clipboard API，需要先创建对象
+    const mockClipboard = {
+      writeText: vi.fn().mockResolvedValue(undefined),
+      readText: vi.fn().mockResolvedValue(''),
+    }
+    Object.defineProperty(navigator, 'clipboard', {
+      value: mockClipboard,
+      writable: true,
+      configurable: true,
     })
   })
 
@@ -236,7 +277,7 @@ describe('TerminalTimeline.vue（单一 xterm）', () => {
     await wrapper.setProps({ mode: 'agent' })
     // 切模式零写入：提示符等用户首次键入时才补打
     expect(mockWrite).not.toHaveBeenCalled()
-    // 非破坏式切换：不得重写“连接中...”占位
+    // 非破坏式切换：不得重写"连接中..."占位
     expect(mockWrite).not.toHaveBeenCalledWith(expect.stringContaining('连接中'))
   })
 
@@ -362,5 +403,185 @@ describe('TerminalTimeline.vue（单一 xterm）', () => {
     typeData('r')
     expect(wrapper.emitted('shellInput')).toEqual([['r']])
     expect(wrapper.emitted('reconnect')).toBeUndefined()
+  })
+
+  // ============ 剪贴板集成（Task 2.2-2.4） ============
+
+  describe('剪贴板集成', () => {
+    it('加载 ClipboardAddon 到终端实例', () => {
+      // WHY: 验证 ClipboardAddon 被加载到终端——0.2.0 仅注册 OSC 52 处理器
+      //      （远端程序如 tmux/vim 写本地剪贴板）；精确断言加载参数类型，
+      //      避免 FitAddon 的加载也满足断言（恒真）导致删掉加载代码测试仍绿
+      mountTimeline()
+      expect(capturedTerminal).not.toBeNull()
+      const terminal = capturedTerminal as any
+      expect(terminal.loadAddon).toHaveBeenCalledWith(expect.any(ClipboardAddon))
+    })
+
+    it('Ctrl+C 有选中时复制选中文本到剪贴板并阻止默认中断', () => {
+      // WHY: 用户选中终端文本后按 Ctrl+C 应该复制而不是发送中断信号
+      mockGetSelection.mockReturnValue('selected text')
+      mountTimeline()
+
+      expect(capturedKeyHandler).not.toBeNull()
+      const event = createCtrlCEvent()
+      const result = capturedKeyHandler!(event)
+
+      expect(navigator.clipboard.writeText).toHaveBeenCalledWith('selected text')
+      expect(result).toBe(false) // 阻止默认中断行为
+    })
+
+    it('Ctrl+C 无选中时放行让 onData 处理中断行为', () => {
+      // WHY: 没有选中文本时 Ctrl+C 应保持原有行为——发送 \x03 中断信号给 PTY
+      mockGetSelection.mockReturnValue('')
+      mountTimeline()
+
+      expect(capturedKeyHandler).not.toBeNull()
+      const event = createCtrlCEvent()
+      const result = capturedKeyHandler!(event)
+
+      expect(navigator.clipboard.writeText).not.toHaveBeenCalled()
+      expect(result).toBe(true) // 放行，让 onData 处理
+    })
+
+    it('右键菜单在 contextmenu 事件时显示', async () => {
+      // WHY: 禁用浏览器默认右键菜单，渲染自定义菜单（复制/粘贴按钮）
+      const wrapper = mountTimeline()
+      await nextTick()
+
+      const container = wrapper.find('.terminal-container')
+      expect(container.exists()).toBe(true)
+
+      // 模拟右键事件
+      await container.trigger('contextmenu', { clientX: 100, clientY: 200 })
+      await nextTick()
+
+      // 菜单应该出现
+      const menu = wrapper.find('[data-role="context-menu"]')
+      expect(menu.exists()).toBe(true)
+    })
+
+    it('右键菜单复制按钮：有选中时启用，无选中时禁用', async () => {
+      // WHY: 复制按钮状态应实时反映终端选中状态
+      // 无选中时挂载
+      mockGetSelection.mockReturnValue('')
+      const wrapper = mountTimeline()
+      await nextTick()
+
+      const container = wrapper.find('.terminal-container')
+      await container.trigger('contextmenu', { clientX: 100, clientY: 200 })
+      await nextTick()
+
+      const copyBtn = wrapper.find('[data-action="copy"]')
+      expect(copyBtn.exists()).toBe(true)
+      expect(copyBtn.attributes('disabled')).toBeDefined()
+
+      // 有选中时
+      mockGetSelection.mockReturnValue('some text')
+      await container.trigger('contextmenu', { clientX: 150, clientY: 250 })
+      await nextTick()
+
+      const copyBtnEnabled = wrapper.find('[data-action="copy"]')
+      // WHY: Vue 绑定 :disabled="false" 时属性可能为 '' 或 undefined，两者均表示未禁用
+      expect(['', undefined]).toContain(copyBtnEnabled.attributes('disabled'))
+    })
+
+    it('右键菜单粘贴按钮：点击后读取剪贴板并发送文本到 PTY', async () => {
+      // WHY: 粘贴功能通过 navigator.clipboard.readText 获取文本，
+      //      再通过 terminal.paste 发送到 PTY
+      ;(navigator.clipboard.readText as any).mockResolvedValueOnce('pasted text')
+
+      const wrapper = mountTimeline()
+      await nextTick()
+
+      const container = wrapper.find('.terminal-container')
+      await container.trigger('contextmenu', { clientX: 100, clientY: 200 })
+      await nextTick()
+
+      const pasteBtn = wrapper.find('[data-action="paste"]')
+      expect(pasteBtn.exists()).toBe(true)
+      await pasteBtn.trigger('click')
+      await nextTick()
+
+      expect(navigator.clipboard.readText).toHaveBeenCalled()
+      expect(mockPaste).toHaveBeenCalledWith('pasted text')
+    })
+
+    it('右键菜单复制失败（writeText reject）时记录错误且菜单仍关闭', async () => {
+      // WHY: Electron 失焦/权限策略变化会使 writeText reject——不捕获会产生
+      //      未处理 rejection 且用户无任何反馈；行为对齐 handlePaste：
+      //      日志降级（console.error）且菜单照常关闭，不阻塞后续终端交互
+      ;(navigator.clipboard.writeText as any).mockRejectedValueOnce(new Error('write denied'))
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+      mockGetSelection.mockReturnValue('selected text')
+      const wrapper = mountTimeline()
+      await nextTick()
+
+      const container = wrapper.find('.terminal-container')
+      await container.trigger('contextmenu', { clientX: 100, clientY: 200 })
+      await nextTick()
+
+      await wrapper.find('[data-action="copy"]').trigger('click')
+      await flushPromises()
+
+      expect(errorSpy).toHaveBeenCalled()
+      // 失败路径与成功路径同构：菜单必须收起，不残留阻塞交互
+      expect(wrapper.find('[data-role="context-menu"]').exists()).toBe(false)
+      errorSpy.mockRestore()
+    })
+
+    it('点击菜单外区域时关闭菜单', async () => {
+      // WHY: 菜单应该在不聚焦时自动关闭，符合用户交互预期
+      const wrapper = mountTimeline()
+      await nextTick()
+
+      const container = wrapper.find('.terminal-container')
+      await container.trigger('contextmenu', { clientX: 100, clientY: 200 })
+      await nextTick()
+
+      expect(wrapper.find('[data-role="context-menu"]').exists()).toBe(true)
+
+      // 点击菜单外区域
+      await document.body.click()
+      await nextTick()
+
+      expect(wrapper.find('[data-role="context-menu"]').exists()).toBe(false)
+    })
+
+    // ============ Ctrl+V 粘贴路径（Task 2.6）============
+
+    it('Ctrl+V 键盘事件不被自定义键处理器拦截（放行浏览器原生 paste → onData）', () => {
+      // WHY: Ctrl+V SHALL 直接将剪贴板内容作为终端输入发送——该路径由浏览器
+      //      原生 paste 事件驱动（xterm 核心监听 textarea/element 的 paste 事件，
+      //      经 triggerDataEvent 触发 onData；ClipboardAddon 0.2.0 仅注册 OSC 52，
+      //      不注册任何键盘处理器）。自定义键处理器必须放行 Ctrl+V，
+      //      一旦拦截（return false）整条原生粘贴路径即被拦断。
+      mountTimeline()
+      expect(capturedKeyHandler).not.toBeNull()
+      const event = new KeyboardEvent('keydown', { key: 'v', ctrlKey: true, bubbles: true })
+      expect(capturedKeyHandler!(event)).toBe(true)
+    })
+
+    it('Shell 模式下 Ctrl+V 粘贴的多词文本作为终端输入直达 PTY', () => {
+      // WHY: 粘贴文本与键入共用 onData 通道（浏览器 paste 事件最终触发 onData）；
+      //      用例钉住粘贴内容原文一次性转发，组件不做二次处理（不重复发送）
+      const wrapper = mountTimeline('shell')
+      // 模拟 xterm 收到浏览器 paste 后经 onData 送达的完整粘贴文本
+      typeData('echo "pasted text"')
+      expect(wrapper.emitted('shellInput')).toEqual([['echo "pasted text"']])
+    })
+
+    it('Agent 模式下 Ctrl+V 粘贴的整段文本进入输入草稿，Enter 后经 agentInput 提交', () => {
+      // WHY: Agent 模式没有 PTY 直发路径，粘贴内容与键入同权进入草稿回显，
+      //      由用户 Enter 决定提交时机——防止粘贴大段文字未经确认直达模型
+      const wrapper = mountTimeline('agent')
+      mockWrite.mockClear()
+      // 粘贴的典型特征：多字符文本一次性到达 onData（含 IME 中文同此通道）
+      typeData('如何查看磁盘占用')
+      // 粘贴文本整体回显进草稿
+      expect(mockWrite).toHaveBeenCalledWith('如何查看磁盘占用')
+      typeData('\r')
+      expect(wrapper.emitted('agentInput')).toEqual([['如何查看磁盘占用']])
+    })
   })
 })
