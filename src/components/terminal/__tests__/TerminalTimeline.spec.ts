@@ -18,9 +18,15 @@ import { ClipboardAddon } from '@xterm/addon-clipboard'
 let capturedOnData: ((data: string) => void) | null = null
 // 捕获 attachCustomKeyEventHandler 注册的键盘事件处理器
 let capturedKeyHandler: ((event: KeyboardEvent) => boolean) | null = null
+// 捕获 terminal.onScroll 回调，供滚动用例手动触发
+let capturedOnScroll: (() => void) | null = null
 const mockWrite = vi.fn()
 const mockPaste = vi.fn()
 const mockGetSelection = vi.fn(() => '')
+const mockScrollToBottom = vi.fn()
+// 模拟 buffer 滚动状态：viewportY 当前视口偏移，baseY 总缓冲行数
+let mockViewportY = 0
+let mockBaseY = 50
 // 捕获最近创建的 Terminal 实例与 FitAddon.fit，供尺寸同步用例改值/断言
 let capturedTerminal: { cols: number; rows: number } | null = null
 const mockFit = vi.fn()
@@ -39,7 +45,7 @@ vi.mock('@xterm/xterm', () => {
         dispose: vi.fn(),
         loadAddon: vi.fn(),
         reset: vi.fn(),
-        scrollToBottom: vi.fn(),
+        scrollToBottom: mockScrollToBottom,
         refresh: vi.fn(),
         open: vi.fn(),
         onData: vi.fn((cb: (data: string) => void) => {
@@ -51,6 +57,18 @@ vi.mock('@xterm/xterm', () => {
           capturedKeyHandler = handler
           return { dispose: vi.fn() }
         }),
+        // WHY: 模拟 xterm onScroll 事件——滚动感知用例需要手动触发滚动回调
+        onScroll: vi.fn((cb: () => void) => {
+          capturedOnScroll = cb
+          return { dispose: vi.fn() }
+        }),
+        // WHY: 模拟 buffer API 供 isViewportAtBottom() 检测滚动位置
+        buffer: {
+          active: {
+            get viewportY() { return mockViewportY },
+            get baseY() { return mockBaseY },
+          },
+        },
         getSelection: mockGetSelection,
         paste: mockPaste,
         element: document.createElement('div'),
@@ -105,9 +123,12 @@ describe('TerminalTimeline.vue（单一 xterm）', () => {
     vi.clearAllMocks()
     capturedOnData = null
     capturedKeyHandler = null
+    capturedOnScroll = null
     capturedTerminal = null
     observerCallbacks = []
     mockGetSelection.mockReturnValue('')
+    mockViewportY = 20 // 默认在底部（baseY=50, rows=30, 50-30=20）
+    mockBaseY = 50
     // jsdom 无 ResizeObserver：stub 收集回调，用例手动触发模拟容器尺寸变化
     vi.stubGlobal('ResizeObserver', class {
       constructor(cb: () => void) {
@@ -582,6 +603,67 @@ describe('TerminalTimeline.vue（单一 xterm）', () => {
       expect(mockWrite).toHaveBeenCalledWith('如何查看磁盘占用')
       typeData('\r')
       expect(wrapper.emitted('agentInput')).toEqual([['如何查看磁盘占用']])
+    })
+  })
+
+  // ============ 滚动位置感知（流式输出不强制滚底） ============
+
+  describe('滚动位置感知', () => {
+    it('writeDuringScrollDoesNotForceScrollToBottom：用户向上滚动后写入不触发 scrollToBottom', async () => {
+      const wrapper = mountTimeline('shell')
+      const vm = wrapper.vm as unknown as { writeToTerminal: (data: string) => void }
+      mockScrollToBottom.mockClear()
+
+      // 模拟用户向上滚动：viewportY 偏离底部（baseY=50, rows=30, 底部=20）
+      mockViewportY = 10 // 远离底部
+      capturedOnScroll?.()
+
+      // 写入数据——不应调用 scrollToBottom
+      vm.writeToTerminal('新输出内容')
+      await nextTick()
+      expect(mockScrollToBottom).not.toHaveBeenCalled()
+      // 数据仍然写入 buffer
+      expect(mockWrite).toHaveBeenCalledWith('新输出内容')
+    })
+
+    it('scrollBackToBottomResumesAutoFollow：滚回底部后恢复自动跟随', async () => {
+      const wrapper = mountTimeline('shell')
+      const vm = wrapper.vm as unknown as { writeToTerminal: (data: string) => void }
+
+      // 先模拟用户向上滚动
+      mockViewportY = 5 // 远离底部
+      capturedOnScroll?.()
+      mockScrollToBottom.mockClear()
+
+      // 写入不应滚底
+      vm.writeToTerminal('内容1')
+      await nextTick()
+      expect(mockScrollToBottom).not.toHaveBeenCalled()
+
+      // 用户滚回底部（viewportY = baseY - rows = 20）
+      mockViewportY = 20
+      capturedOnScroll?.()
+      mockScrollToBottom.mockClear()
+
+      // 后续写入应恢复自动滚底
+      vm.writeToTerminal('内容2')
+      await nextTick()
+      expect(mockScrollToBottom).toHaveBeenCalled()
+    })
+
+    it('refit 无条件清除滚动标志并滚底（切回 tab 时用户期望看到最新内容）', async () => {
+      const wrapper = mountTimeline('shell')
+      const vm = wrapper.vm as unknown as { refit: () => void }
+
+      // 先模拟用户向上滚动
+      mockViewportY = 5
+      capturedOnScroll?.()
+      mockScrollToBottom.mockClear()
+
+      // refit 应无条件滚底
+      vm.refit()
+      await nextTick()
+      expect(mockScrollToBottom).toHaveBeenCalled()
     })
   })
 })

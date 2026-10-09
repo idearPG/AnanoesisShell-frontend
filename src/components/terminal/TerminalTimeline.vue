@@ -104,6 +104,14 @@ let resizeHandler: (() => void) | null = null
 let dataDisposable: { dispose: () => void } | null = null
 /** 容器尺寸变化监听（侧边栏开合/tab 切回/窗口缩放）：回调里统一走 syncSize */
 let containerObserver: ResizeObserver | null = null
+/**
+ * 用户是否已主动向上滚动离开底部。
+ * WHY: Agent 流式回复期间每次 writeToTerminal 都无条件 scrollToBottom，
+ *      用户向上滚动查看历史被立即拉回。改为条件滚底：仅当视口在底部时才跟随。
+ */
+const userScrolledAway = ref(false)
+/** xterm onScroll 事件订阅（用于释放） */
+let scrollDisposable: { dispose: () => void } | null = null
 /** 最近一次已 emit 给远端的 winsize：去重避免同尺寸重复发帧；0 表示从未同步 */
 let lastSyncedCols = 0
 let lastSyncedRows = 0
@@ -294,6 +302,12 @@ function initTerminal(): void {
     }
   })
 
+  // WHY: 监听 xterm 滚动事件——用户向上滚动时置位 userScrolledAway，
+  //      writeToTerminal 据此跳过 scrollToBottom；滚回底部时自动恢复跟随
+  scrollDisposable = terminal.onScroll(() => {
+    userScrolledAway.value = !isViewportAtBottom()
+  })
+
   resizeHandler = () => syncSize()
   window.addEventListener('resize', resizeHandler)
 
@@ -429,6 +443,8 @@ function showInitialPrompt(): void {
 function cleanupTerminal(): void {
   dataDisposable?.dispose()
   dataDisposable = null
+  scrollDisposable?.dispose()
+  scrollDisposable = null
   containerObserver?.disconnect()
   containerObserver = null
   if (resizeHandler) {
@@ -462,12 +478,27 @@ function writeToTerminal(data: string): void {
     agentPromptOpen = false
   }
   terminal?.write(data)
-  scrollToBottom()
+  // WHY: 仅在用户视口位于底部时才自动滚底——Agent 流式回复期间每次
+  //      写入都无条件 scrollToBottom 会把正在向上滚动查看历史的用户拉回，
+  //      改为条件跟随：用户主动滚动离开底部后新输出照常写入 buffer 但不滚底
+  if (!userScrolledAway.value) {
+    scrollToBottom()
+  }
 }
 
 /** 滚动到终端底部 */
 function scrollToBottom(): void {
   nextTick(() => terminal?.scrollToBottom())
+}
+
+/**
+ * 检测视口是否位于底部（容差 2 行）。
+ * WHY: 封装为独立函数便于测试和 xterm API 升级时只改一处。
+ */
+function isViewportAtBottom(): boolean {
+  if (!terminal) return true
+  const buffer = terminal.buffer.active
+  return buffer.viewportY >= buffer.baseY - terminal.rows - 2
 }
 
 /**
@@ -481,6 +512,8 @@ function scrollToBottom(): void {
 function refit(): void {
   if (!terminal) return
   terminal.refresh(0, terminal.rows - 1)
+  // WHY: 切回 tab 时用户期望看到最新内容，无条件跟随
+  userScrolledAway.value = false
   scrollToBottom()
   syncSize(true)
 }
